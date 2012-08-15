@@ -392,3 +392,243 @@ class PipedZookeeperClient(object, service.Service):
             raise zookeeper.ClosingException()
 
         return getattr(client, item)
+
+
+
+class _LockService(object, service.Service):
+
+    def __init__(self, client_dependency, path):
+        self.client = client_dependency
+        self.path = path
+        self.lock_acquired = event.Event()
+        self.lock_released = event.Event()
+        self.lock = None
+
+        self.client.on_connected += lambda _: self._maybe_start()
+        self.client.on_disconnected += lambda _: self.stopService()
+        self.client.on_before_disconnect += self._cleanup
+
+        self._currently = None
+        self.currently = util.create_deferred_state_watcher(self)
+        self._maybe_start()
+
+    @property
+    def is_acquired(self):
+        return self.lock and self.lock.acquired
+
+    def _maybe_start(self):
+        if self.client.connected:
+            self._run()
+
+    @defer.inlineCallbacks
+    def _run(self):
+        if self.running:
+            print 'Trying to acquire', self.path
+            try:
+                self.lock = lock.Lock(self.path, self.client)
+                yield self.currently(self.lock.acquire())
+                print 'Got it :D'
+                self.lock_acquired()
+                
+            except defer.CancelledError:
+                pass
+
+    def stopService(self):
+        service.Service.stopService(self)
+        if self._currently:
+            self._currently.cancel()
+
+        self._cleanup()
+
+    def _cleanup(self):
+        if self.is_acquired:
+            try:
+                self.lock.release()
+            except zookeeper.ClosingException:
+                pass
+            self.lock_released()    
+
+
+class _NodeDeleted(Exception):
+    pass
+
+
+class PipedZookeeperStreamer(object, service.MultiService):
+
+    def __init__(self, client):
+        service.MultiService.__init__(self)
+        self.zookeeper_client_name = client
+        self.client_dependency = None
+        self._currently = None
+        self.currently = util.create_deferred_state_watcher(self)
+        self.vent = event.Event()
+        self._roots = set()
+
+        def cb(*args, **kw):
+            print 'vented: ', args, kw
+
+        self.vent += cb
+
+    def configure(self, runtime_environment):
+        self.runtime_environment = runtime_environment
+        dm = runtime_environment.dependency_manager
+
+        self.client_dependency = dm.add_dependency(self, dict(provider='zookeeper.client.{0}'.format(self.zookeeper_client_name)))
+
+        self.client_dependency.on_ready += lambda dep: self._consider_starting()
+        self.client_dependency.on_lost += lambda dep, reason: self.do_stop()
+        
+    def _consider_starting(self):
+        if self.client_dependency.is_ready and self.running:
+            self.do_start()
+
+    def stopService(self):
+        service.MultiService.stopService(self)
+
+    @defer.inlineCallbacks
+    def do_start(self):
+        self.client = yield self.client_dependency.wait_for_resource()
+        self.watch_root('/test')
+
+    def do_stop(self):
+        if self._currently:
+            self._currently.cancel()
+        
+    def watch_root(self, prefix='/'):
+        self._roots.add(prefix)
+        return self._watch_all_the_nodes(prefix)
+
+    @defer.inlineCallbacks
+    def _watch_all_the_nodes(self, prefix='/'):
+
+        try:
+            while self.running:
+                exists, exists_watcher = self.client.exists_and_watch(prefix)
+                exists = yield self.currently(exists)
+
+                if not exists and prefix in self._roots:
+                    yield self.currently(exists_watcher)
+                else:
+                    # It exists at the moment, so that changing should meant it's deleted
+                    until_deleted = self._fail_when_deleted(prefix) #, exists_watcher)
+                    self._watch_children(prefix, until_deleted)
+                    self._notify_changes(prefix, until_deleted)
+
+                    try:
+                        yield self.currently(until_deleted)
+                    except (_NodeDeleted, zookeeper.NoNodeException):
+                        pass
+
+                    # Only continue if we're a root. If we're not, a
+                    # parent handler will start us up again if we're
+                    # recreated.
+                    if prefix not in self._roots:
+                        break
+        except defer.CancelledError:
+            pass
+            
+    @defer.inlineCallbacks
+    def _fail_when_deleted(self, path):
+        while self.running:
+            try:
+                exists, exists_watcher = self.client.exists_and_watch(path)
+                exists = yield self.currently(exists)
+                if exists:
+                    yield self.currently(exists_watcher)
+                else:
+                    raise _NodeDeleted()
+            except zookeeper.NoNodeException:
+                raise _NodeDeleted()
+                
+    @defer.inlineCallbacks
+    def _watch_children(self, prefix, until_deleted):
+        known_children = set()
+
+        children, children_changed = self.client.get_children_and_watch(prefix)
+        try:
+            while self.running:
+                set_of_children = set((yield self.wait_until_deleted(children, until_deleted)))
+                
+                known_children = known_children & set_of_children
+                for child in set_of_children:
+                    if child in known_children:
+                        continue
+                    known_children.add(child)
+                    child = prefix.rstrip('/') + '/' + child                        
+                    if self._should_watch(child):
+                        self._watch_all_the_nodes(child)
+
+                change = yield self.wait_until_deleted(children_changed, until_deleted)
+
+                # What we care about here is the change.
+                # (because deletions sort themselves out with the exists-check)
+                children, children_changed = self.client.get_children_and_watch(prefix)
+
+        except (_NodeDeleted, zookeeper.NoNodeException):
+            self.vent(dict(deleted=prefix))
+            children.addErrback(lambda f: None)
+            children_changed.addErrback(lambda f: None)
+
+        except defer.CancelledError:
+            pass
+        except Exception as e:
+            logger.exception('Unhandled error in _watch_children. Exception follows')
+
+    @defer.inlineCallbacks
+    def _notify_changes(self, path, until_deleted):
+        data, data_changed = self.client.get_and_watch(path)
+        try:
+            while self.running:
+                self.vent(dict(path=path, data=(yield self.wait_until_deleted(data, until_deleted))))
+                yield util.wait(.1)
+                result = yield self.wait_until_deleted(data_changed, until_deleted)
+                data, data_changed = self.client.get_and_watch(path)
+                
+        except (_NodeDeleted, zookeeper.NoNodeException):
+            data.addErrback(lambda f: None)
+            data_changed.addErrback(lambda f: None)
+
+        except defer.CancelledError:
+            pass
+        except Exception as e:
+            logger.exception('Unhandled error in _notify changes. Exception follows')
+
+    def _should_watch(self, path):
+        return True
+
+    @defer.inlineCallbacks
+    def wait_until_deleted(self, d, until_deleted):
+        try:
+            result, index = yield self.currently(defer.DeferredList([until_deleted, d], fireOnOneCallback=True, fireOnOneErrback=True, consumeErrors=False))
+            # In case the same until_deleted is reused after it's been "handled" in a yield on it longer up, in which case it'll be a None.
+            # If the until_deleted is callbacked or errbacked, we're raising here anyway.
+            if index == 0:
+                raise _NodeDeleted()
+            else:
+                defer.returnValue(result)
+        except defer.FirstError as fe:
+            d.addErrback(lambda f: None)
+            fe.subFailure.raiseException()
+
+
+class ZookeeperStreamerProvider(ZookeeperClientProvider):
+    interface.classProvides(resource.IResourceProvider)
+
+    client_factory = PipedZookeeperStreamer
+
+    def __init__(self):
+        service.MultiService.__init__(self)
+        self._client_by_name = dict()
+    
+    def configure(self, runtime_environment):
+        self.setName('zookeeper-streamer')
+        self.setServiceParent(runtime_environment.application)
+        self.runtime_environment = runtime_environment
+
+        self.clients = runtime_environment.get_configuration_value('zookeeper.streamers', dict())
+        resource_manager = runtime_environment.resource_manager
+
+        for client_name, client_configuration in self.clients.items():
+            self._get_or_create_client(client_name)
+            resource_manager.register('zookeeper.streamer.%s' % client_name, provider=self)
+        
