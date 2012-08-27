@@ -2,12 +2,9 @@ from piped import service, util
 import zookeeper
 
 
-DELETED = 2
-
-
 class WatchingZNode(service.PipedService):
 
-    def __init__(self, client, path, callback, matcher=lambda path: True):
+    def __init__(self, client, path, callback, matcher=lambda path: True, is_root=True):
 	super(WatchingZNode, self).__init__()
 	self.callback = callback
 	self.path = path
@@ -66,7 +63,7 @@ class WatchingZNode(service.PipedService):
 	# from deleted to existing or vice versa.
 
 	did_exist = self._exists
-	self._exists = event != DELETED
+	self._exists = event != zookeeper.DELETED_EVENT
 	if did_exist and self._exists:
 	    # Wait for the next change.
 	    self._keep_watching()
@@ -126,6 +123,6 @@ class WatchingZNode(service.PipedService):
 	    if not self.matcher(full_path):
 		continue
 
-	    child_watcher = WatchingZNode(self.client, full_path, self.callback, matcher=self.matcher, is_root=False)
+	    child_watcher = self.__class__(self.client, full_path, self.callback, matcher=self.matcher, is_root=False)
 	    child_watcher.setServiceParent(self)
 	    self._children[child] = child_watcher
