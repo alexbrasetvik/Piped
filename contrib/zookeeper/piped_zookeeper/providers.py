@@ -112,7 +112,7 @@ class PipedZookeeperClient(object, service.Service):
     _current_client = None
     _currently_connecting = None
     _currently_reconnecting = None
-    
+
     def __init__(self, servers=None, connect_timeout=86400, reconnect_timeout=30, session_timeout=None, reuse_session=True, events=None):
         self.servers = self._parse_servers(servers)
         self.connect_timeout = connect_timeout
@@ -147,7 +147,7 @@ class PipedZookeeperClient(object, service.Service):
                 raise exceptions.ConfigurationError(e_msg, detail)
 
             self.events[key] = dict(provider=value) if isinstance(value, basestring) else value
-        
+
         self.dependencies = runtime_environment.create_dependency_map(self, **self.events)
 
     @defer.inlineCallbacks
@@ -335,7 +335,7 @@ class PipedZookeeperClient(object, service.Service):
             # we're the first one in our process attempting to access this cached result,
             # so we get the honors of setting it up
             self._pending[cache_tuple] = event.Event()
-            
+
             d, watcher = func(*a, **kw)
 
             def _watch_fired(event):
@@ -429,7 +429,7 @@ class _LockService(object, service.Service):
                 yield self.currently(self.lock.acquire())
                 print 'Got it :D'
                 self.lock_acquired()
-                
+
             except defer.CancelledError:
                 pass
 
@@ -446,7 +446,7 @@ class _LockService(object, service.Service):
                 self.lock.release()
             except zookeeper.ClosingException:
                 pass
-            self.lock_released()    
+            self.lock_released()
 
 
 class _NodeDeleted(Exception):
@@ -477,7 +477,7 @@ class PipedZookeeperStreamer(object, service.MultiService):
 
         self.client_dependency.on_ready += lambda dep: self._consider_starting()
         self.client_dependency.on_lost += lambda dep, reason: self.do_stop()
-        
+
     def _consider_starting(self):
         if self.client_dependency.is_ready and self.running:
             self.do_start()
@@ -493,7 +493,7 @@ class PipedZookeeperStreamer(object, service.MultiService):
     def do_stop(self):
         if self._currently:
             self._currently.cancel()
-        
+
     def watch_root(self, prefix='/'):
         self._roots.add(prefix)
         return self._watch_all_the_nodes(prefix)
@@ -526,7 +526,7 @@ class PipedZookeeperStreamer(object, service.MultiService):
                         break
         except defer.CancelledError:
             pass
-            
+
     @defer.inlineCallbacks
     def _fail_when_deleted(self, path):
         while self.running:
@@ -539,7 +539,7 @@ class PipedZookeeperStreamer(object, service.MultiService):
                     raise _NodeDeleted()
             except zookeeper.NoNodeException:
                 raise _NodeDeleted()
-                
+
     @defer.inlineCallbacks
     def _watch_children(self, prefix, until_deleted):
         known_children = set()
@@ -548,13 +548,13 @@ class PipedZookeeperStreamer(object, service.MultiService):
         try:
             while self.running:
                 set_of_children = set((yield self.wait_until_deleted(children, until_deleted)))
-                
+
                 known_children = known_children & set_of_children
                 for child in set_of_children:
                     if child in known_children:
                         continue
                     known_children.add(child)
-                    child = prefix.rstrip('/') + '/' + child                        
+                    child = prefix.rstrip('/') + '/' + child
                     if self._should_watch(child):
                         self._watch_all_the_nodes(child)
 
@@ -583,7 +583,7 @@ class PipedZookeeperStreamer(object, service.MultiService):
                 yield util.wait(.1)
                 result = yield self.wait_until_deleted(data_changed, until_deleted)
                 data, data_changed = self.client.get_and_watch(path)
-                
+
         except (_NodeDeleted, zookeeper.NoNodeException):
             data.addErrback(lambda f: None)
             data_changed.addErrback(lambda f: None)
@@ -619,7 +619,7 @@ class ZookeeperStreamerProvider(ZookeeperClientProvider):
     def __init__(self):
         service.MultiService.__init__(self)
         self._client_by_name = dict()
-    
+
     def configure(self, runtime_environment):
         self.setName('zookeeper-streamer')
         self.setServiceParent(runtime_environment.application)
@@ -631,4 +631,3 @@ class ZookeeperStreamerProvider(ZookeeperClientProvider):
         for client_name, client_configuration in self.clients.items():
             self._get_or_create_client(client_name)
             resource_manager.register('zookeeper.streamer.%s' % client_name, provider=self)
-        
